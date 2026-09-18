@@ -79,6 +79,14 @@ make
 - ✅ 更新文档
 - ✅ 删除文档
 
+### 乐观并发控制（编辑场景）
+
+- ✅ 读取文档时一并取得编辑凭据（`_seq_no` + `_primary_term`）
+- ✅ 条件更新 / 条件删除：凭据匹配才写入，返回新的版本信息
+- ✅ 凭据过期返回 409 冲突并带回服务器当前快照（供展示差异），不自动重试、不覆盖
+- ✅ 明确区分：冲突（409）、文档不存在/已删除（404）、无效凭据（客户端校验）、服务端失败（异常）
+- ✅ 非交互式导入仍可使用原有的无条件写入接口
+
 ### 全文检索
 
 - ✅ Match 查询（分词匹配）
@@ -140,7 +148,9 @@ make
 2. **批量导入** - 导入示例文章数据
 3. **全文检索** - 演示各种搜索方式
 4. **高亮显示** - 展示搜索结果高亮
-5. **清理资源** - 删除测试索引
+5. **文档 CRUD** - 演示单文档的增删改查
+6. **乐观并发控制** - 两个独立客户端模拟两名编辑交错保存、保存后再删除
+7. **清理资源** - 删除测试索引
 
 ### 输出示例
 
@@ -173,6 +183,38 @@ make
   演示完成！
 ========================================
 ```
+
+## 乐观并发控制用法
+
+交互式编辑场景（如两名编辑同时修改同一篇文章）使用条件读写接口，
+避免较晚保存的人在不知情的情况下覆盖他人的修改：
+
+```cpp
+// 1. 打开文章：读取内容并取得编辑凭据（_seq_no + _primary_term）
+auto doc = client.getDocumentForUpdate("articles", "article-1");
+if (!doc) { /* 文章不存在或已删除 */ }
+
+// 2. 保存：携带凭据的条件更新
+auto result = client.updateDocument("articles", "article-1",
+                                    {{"title", "新标题"}}, doc->version);
+if (result.success()) {
+    // 保存成功，result.newVersion 是新的编辑凭据
+} else if (result.status == es::ConditionalStatus::Conflict) {
+    // 409：他人已抢先修改。result.current 是服务器当前快照，
+    // 可据此向编辑展示差异；快照为空表示文章已被他人删除。
+    // 客户端不会自动重试，也不会覆盖他人修改
+} else if (result.status == es::ConditionalStatus::NotFound) {
+    // 文章不存在
+}
+
+// 3. 删除同样携带凭据
+auto del = client.deleteDocument("articles", "article-1", doc->version);
+```
+
+无效凭据（如负的 `seq_no`）由客户端校验直接抛出 `ESException`（不发送请求）；
+5xx/400 等服务端失败同样抛出 `ESException`，均与 409 冲突明确区分。
+批量导入等非交互式场景仍可使用原有的 `indexDocument` / `updateDocument` /
+`deleteDocument` 无条件接口。
 
 ## 扩展开发
 

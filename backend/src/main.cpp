@@ -391,9 +391,211 @@ void demoDocumentCRUD(ESClient& client, const std::string& indexName) {
     }
 }
 
+// ==================== 乐观并发演示辅助 ====================
+
+std::string formatCredential(const VersionInfo& v) {
+    return "seq_no=" + std::to_string(v.seqNo) +
+           ", primary_term=" + std::to_string(v.primaryTerm) +
+           " (_version=" + std::to_string(v.version) + ")";
+}
+
+void printArticleBrief(const json& source) {
+    std::cout << "      title: " << source.value("title", "") << "\n";
+    std::cout << "      tags:  " << source.value("tags", json::array()).dump() << "\n";
+}
+
+/**
+ * 乐观并发控制演示：
+ * 两个独立的 ESClient 实例模拟两名编辑同时编辑同一篇文章。
+ * 场景一：交错保存 —— 首个修改成功、旧凭据被拒、重新读取并人工合并后成功；
+ * 场景二：保存后再删除 —— 过期凭据的删除/保存均被拒，文章保持已确认的状态。
+ */
+void demoOptimisticConcurrency(const std::string& host, int port) {
+    printSection(10, "乐观并发控制演示（两名编辑同时编辑同一篇文章）");
+
+    const std::string indexName = "editor_articles";
+    const std::string docId = "article-1";
+    bool allOk = true;
+
+    // 校验辅助：打印结果并记录失败
+    auto check = [&allOk](bool ok, const std::string& label) {
+        if (ok) {
+            printSuccess(label);
+        } else {
+            printError(label + " 【校验失败】");
+            allOk = false;
+        }
+    };
+
+    // 两个独立的客户端连接 = 两名编辑各自独立的编辑会话
+    ESClient editorA(host, port);
+    ESClient editorB(host, port);
+
+    try {
+        // ---------- 准备：非交互式导入（仍使用原有的无条件写入接口） ----------
+        if (editorA.indexExists(indexName)) {
+            editorA.deleteIndex(indexName);
+        }
+        json mappings = {
+            {"properties", {
+                {"title", {{"type", "text"}, {"analyzer", "standard"}}},
+                {"content", {{"type", "text"}, {"analyzer", "standard"}}},
+                {"tags", {{"type", "keyword"}}}
+            }}
+        };
+        editorA.createIndex(indexName, mappings);
+
+        json article = {
+            {"title", "Elasticsearch 实战指南"},
+            {"content", "本文介绍 Elasticsearch 的核心概念与使用方法。"},
+            {"tags", json::array({"Elasticsearch", "搜索"})}
+        };
+        auto imported = editorA.indexDocument(indexName, article, docId);  // 无条件写入
+        editorA.refreshIndex(indexName);
+        printInfo("初始文章已通过无条件接口导入, ID: " + imported.id);
+
+        // ==================== 场景一：交错保存 ====================
+        printInfo("场景一：两名编辑交错保存同一篇文章");
+
+        // 1) 两名编辑同时打开文章，拿到相同的编辑凭据
+        auto docA = editorA.getDocumentForUpdate(indexName, docId);
+        auto docB = editorB.getDocumentForUpdate(indexName, docId);
+        if (!docA || !docB) {
+            throw ESException("演示数据异常：文章读取失败");
+        }
+        std::cout << "  编辑A 打开文章，凭据: " << formatCredential(docA->version) << "\n";
+        std::cout << "  编辑B 打开文章，凭据: " << formatCredential(docB->version) << "\n";
+        check(docA->version.seqNo == docB->version.seqNo &&
+              docA->version.primaryTerm == docB->version.primaryTerm,
+              "两名编辑拿到相同凭据（基于同一版本编辑）");
+
+        // 2) 编辑A 先保存（修改标题）→ 成功并获得新凭据
+        auto saveA = editorA.updateDocument(indexName, docId,
+            {{"title", "Elasticsearch 实战指南（2024 修订版）"}}, docA->version);
+        check(saveA.success(), "编辑A 保存成功（首个修改被接受）");
+        std::cout << "  编辑A 新凭据: " << formatCredential(saveA.newVersion) << "\n";
+
+        // 3) 编辑B 仍持旧凭据保存（修改标签）→ 409 冲突，客户端带回当前快照
+        json editBTags = json::array({"Elasticsearch", "搜索", "Kibana"});
+        auto saveB = editorB.updateDocument(indexName, docId,
+            {{"tags", editBTags}}, docB->version);
+        check(saveB.status == ConditionalStatus::Conflict,
+              std::string("编辑B 的旧凭据被拒绝（status=") + toString(saveB.status) +
+              (saveB.errorType.empty() ? "" : ", " + saveB.errorType) + "）");
+        if (saveB.current) {
+            std::cout << Color::YELLOW << "  冲突！可据此向编辑展示差异：\n" << Color::RESET;
+            std::cout << "  服务器当前快照 (凭据: " << formatCredential(saveB.current->version) << "):\n";
+            printArticleBrief(saveB.current->source);
+            std::cout << "  编辑B 本地待保存的修改:\n";
+            std::cout << "      tags:  " << editBTags.dump() << "\n";
+        }
+        check(saveB.current.has_value() &&
+              saveB.current->source.value("title", "") == "Elasticsearch 实战指南（2024 修订版）",
+              "冲突响应带回了编辑A 保存后的当前快照");
+
+        // 4) 编辑B 重新读取 → 人工合并 → 携带新凭据再次保存 → 成功
+        auto fresh = editorB.getDocumentForUpdate(indexName, docId);
+        if (!fresh) {
+            throw ESException("演示数据异常：文章重新读取失败");
+        }
+        json merged = fresh->source;          // 保留服务器上编辑A 的标题
+        merged["tags"] = editBTags;           // 合并编辑B 自己的标签修改
+        std::cout << "  编辑B 重新读取 (凭据: " << formatCredential(fresh->version)
+                  << ")，人工合并后重新保存...\n";
+        auto saveB2 = editorB.updateDocument(indexName, docId, merged, fresh->version);
+        check(saveB2.success(), "编辑B 合并后保存成功");
+
+        // 5) 校验最终内容：两名编辑的修改都保留，没有静默覆盖
+        auto finalDoc = editorA.getDocumentForUpdate(indexName, docId);
+        check(finalDoc.has_value() &&
+              finalDoc->source.value("title", "") == "Elasticsearch 实战指南（2024 修订版）" &&
+              finalDoc->source.value("tags", json::array()) == editBTags,
+              "最终内容 = 编辑A 的标题 + 编辑B 的标签（双方修改均保留）");
+        if (finalDoc) {
+            printArticleBrief(finalDoc->source);
+        }
+
+        // ==================== 场景二：保存后再删除 ====================
+        printInfo("场景二：保存后再删除 —— 过期凭据的删除与迟到保存");
+
+        // 1) 编辑A 打开文章（拿到当前凭据）
+        auto opened = editorA.getDocumentForUpdate(indexName, docId);
+        if (!opened) {
+            throw ESException("演示数据异常：文章读取失败");
+        }
+        std::cout << "  编辑A 打开文章，凭据: " << formatCredential(opened->version) << "\n";
+
+        // 2) 编辑B 仍持有场景一的旧凭据，尝试直接删除 → 被拒绝
+        auto staleDelete = editorB.deleteDocument(indexName, docId, docB->version);
+        check(staleDelete.status == ConditionalStatus::Conflict &&
+              staleDelete.current.has_value(),
+              "编辑B 用过期凭据删除被拒绝（文章未被误删）");
+
+        // 3) 编辑B 重新读取，凭最新凭据删除 → 成功
+        auto beforeDelete = editorB.getDocumentForUpdate(indexName, docId);
+        if (!beforeDelete) {
+            throw ESException("演示数据异常：文章读取失败");
+        }
+        auto del = editorB.deleteDocument(indexName, docId, beforeDelete->version);
+        check(del.success() && del.result == "deleted",
+              "编辑B 凭最新凭据删除成功（删除被明确确认）");
+
+        // 4) 编辑A 仍持旧凭据保存 → 冲突，当前快照为空 = 文章已被删除
+        auto lateSave = editorA.updateDocument(indexName, docId,
+            {{"title", "编辑A 的迟到保存"}}, opened->version);
+        if (lateSave.status == ConditionalStatus::Conflict && !lateSave.current) {
+            printSuccess("编辑A 的迟到保存被拒绝：文章已被他人删除"
+                         "（冲突且无当前快照），未自动重建");
+        } else if (lateSave.status == ConditionalStatus::NotFound) {
+            printSuccess("编辑A 的迟到保存被拒绝：文章已不存在"
+                         "（not_found），未自动重建");
+        } else {
+            printError("编辑A 的迟到保存未被正确拒绝 【校验失败】");
+            allOk = false;
+        }
+
+        // 5) 校验：文章确实保持已删除状态 —— ES 中只保留明确确认过的内容
+        auto gone = editorA.getDocumentForUpdate(indexName, docId);
+        check(!gone.has_value(), "最终状态：文章保持已删除，未被旧凭据的写入复活");
+
+        // ==================== 边界：与 409 冲突区分的其他结果 ====================
+        printInfo("边界情况：区分冲突、文档不存在与无效凭据");
+
+        // 对不存在的文档做条件更新 → NotFound（不是冲突）
+        auto missing = editorA.updateDocument(indexName, "no-such-article",
+            {{"title", "不存在的文章"}}, VersionInfo{0, 1});
+        check(missing.status == ConditionalStatus::NotFound,
+              std::string("条件更新不存在的文档 → ") + toString(missing.status) +
+              "（与 409 冲突区分）");
+
+        // 无效凭据（seq_no 为负）→ 客户端校验直接拒绝，不发送请求
+        try {
+            (void)editorA.updateDocument(indexName, docId,
+                {{"title", "x"}}, VersionInfo{-5, 1});
+            printError("无效凭据未被拒绝 【校验失败】");
+            allOk = false;
+        } catch (const ESException& e) {
+            printSuccess(std::string("无效凭据被客户端拒绝: ") + e.what());
+        }
+
+        // ---------- 清理演示索引 ----------
+        editorA.deleteIndex(indexName);
+        printInfo("演示索引 '" + indexName + "' 已清理");
+
+        if (!allOk) {
+            throw ESException("乐观并发演示存在校验失败项");
+        }
+        printSuccess("乐观并发控制演示全部通过");
+    } catch (...) {
+        // 尽量清理演示索引，避免残留
+        try { editorA.deleteIndex(indexName); } catch (...) {}
+        throw;
+    }
+}
+
 void demoCleanup(ESClient& client, const std::string& indexName) {
-    printSection(10, "清理资源");
-    
+    printSection(11, "清理资源");
+
     try {
         client.deleteIndex(indexName);
         printSuccess("索引 '" + indexName + "' 已删除");
@@ -456,6 +658,7 @@ int main() {
         demoBoolSearch(client, indexName);
         demoHighlightSearch(client, indexName);
         demoDocumentCRUD(client, indexName);
+        demoOptimisticConcurrency(host, port);
         demoCleanup(client, indexName);
         
         printHeader("演示完成！");

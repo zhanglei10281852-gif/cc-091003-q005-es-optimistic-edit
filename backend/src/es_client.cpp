@@ -255,6 +255,136 @@ BulkResult ESClient::bulkIndex(const std::string& indexName,
     return result;
 }
 
+// ==================== 乐观并发控制（条件读写） ====================
+
+const char* toString(ConditionalStatus status) {
+    switch (status) {
+        case ConditionalStatus::Success:  return "success";
+        case ConditionalStatus::Conflict: return "conflict";
+        case ConditionalStatus::NotFound: return "not_found";
+    }
+    return "unknown";
+}
+
+namespace {
+
+/// 从 ES 错误响应体中提取 error.type（可能缺失或为非对象，需防御）
+std::string extractErrorType(const json& respJson) {
+    auto it = respJson.find("error");
+    if (it != respJson.end() && it->is_object()) {
+        return it->value("type", "");
+    }
+    return "";
+}
+
+/// 校验编辑凭据，无效凭据在客户端直接拒绝（不发送请求）
+void validateCredentials(const VersionInfo& expected) {
+    if (!expected.valid()) {
+        throw ESException("Invalid edit credentials (seq_no=" +
+                          std::to_string(expected.seqNo) + ", primary_term=" +
+                          std::to_string(expected.primaryTerm) +
+                          "): please obtain fresh credentials via getDocumentForUpdate()");
+    }
+}
+
+} // namespace
+
+std::optional<VersionedDocument> ESClient::getDocumentForUpdate(const std::string& indexName,
+                                                                const std::string& id) {
+    auto response = httpClient_.get(buildUrl("/" + indexName + "/_doc/" + id));
+
+    if (response.isNotFound()) {
+        return std::nullopt;
+    }
+
+    if (!response.isSuccess()) {
+        throw ESException("Failed to get document: " + response.body);
+    }
+
+    auto respJson = json::parse(response.body);
+    if (!respJson.value("found", false)) {
+        return std::nullopt;
+    }
+
+    VersionedDocument doc;
+    doc.id = respJson.value("_id", "");
+    doc.index = respJson.value("_index", "");
+    doc.version.seqNo = respJson.value("_seq_no", -1LL);
+    doc.version.primaryTerm = respJson.value("_primary_term", -1LL);
+    doc.version.version = respJson.value("_version", 0);
+    doc.source = respJson.value("_source", json::object());
+    return doc;
+}
+
+ConditionalWriteResult ESClient::parseConditionalResponse(const HttpResponse& response,
+                                                          const std::string& indexName,
+                                                          const std::string& id) {
+    ConditionalWriteResult result;
+    auto respJson = response.body.empty() ? json::object() : json::parse(response.body);
+
+    if (response.isSuccess()) {
+        result.status = ConditionalStatus::Success;
+        result.result = respJson.value("result", "");
+        result.newVersion.seqNo = respJson.value("_seq_no", -1LL);
+        result.newVersion.primaryTerm = respJson.value("_primary_term", -1LL);
+        result.newVersion.version = respJson.value("_version", 0);
+        log("Conditional write succeeded: " + id + " (" + result.result + ")");
+        return result;
+    }
+
+    if (response.isConflict()) {
+        // 409 版本冲突：带回服务器当前快照供上层展示差异；
+        // 快照为空表示文档已被他人删除。不自动重试、不覆盖。
+        result.status = ConditionalStatus::Conflict;
+        result.errorType = extractErrorType(respJson);
+        result.current = getDocumentForUpdate(indexName, id);
+        log("Conditional write conflict: " + id);
+        return result;
+    }
+
+    if (response.isNotFound()) {
+        // 文档不存在（从未创建，或删除标记已被清理），与 409 冲突明确区分
+        result.status = ConditionalStatus::NotFound;
+        result.errorType = extractErrorType(respJson);
+        log("Conditional write target missing: " + id);
+        return result;
+    }
+
+    // 真正的服务端失败（5xx、400 等）：抛异常，与冲突明确区分
+    throw ESException("Conditional write failed (HTTP " +
+                      std::to_string(response.statusCode) + "): " + response.body);
+}
+
+ConditionalWriteResult ESClient::updateDocument(const std::string& indexName,
+                                                const std::string& id,
+                                                const json& doc,
+                                                const VersionInfo& expected) {
+    validateCredentials(expected);
+
+    std::ostringstream url;
+    url << "/" << indexName << "/_update/" << id
+        << "?if_seq_no=" << expected.seqNo
+        << "&if_primary_term=" << expected.primaryTerm;
+
+    json body = {{"doc", doc}};
+    auto response = httpClient_.post(buildUrl(url.str()), body.dump());
+    return parseConditionalResponse(response, indexName, id);
+}
+
+ConditionalWriteResult ESClient::deleteDocument(const std::string& indexName,
+                                                const std::string& id,
+                                                const VersionInfo& expected) {
+    validateCredentials(expected);
+
+    std::ostringstream url;
+    url << "/" << indexName << "/_doc/" << id
+        << "?if_seq_no=" << expected.seqNo
+        << "&if_primary_term=" << expected.primaryTerm;
+
+    auto response = httpClient_.del(buildUrl(url.str()));
+    return parseConditionalResponse(response, indexName, id);
+}
+
 // ==================== 搜索操作 ====================
 
 SearchResult ESClient::parseSearchResponse(const json& response) {

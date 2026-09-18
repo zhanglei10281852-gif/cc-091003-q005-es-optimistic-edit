@@ -23,6 +23,10 @@ struct HttpResponse {
     bool isNotFound() const {
         return statusCode == 404;
     }
+
+    bool isConflict() const {
+        return statusCode == 409;
+    }
 };
 
 /**

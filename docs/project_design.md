@@ -37,6 +37,9 @@ classDiagram
         +deleteDocument(index, id)
         +search(index, query)
         +bulkIndex(index, docs)
+        +getDocumentForUpdate(index, id)
+        +updateDocument(index, id, doc, expected)
+        +deleteDocument(index, id, expected)
     }
 
     class HttpClient {
@@ -69,6 +72,9 @@ classDiagram
 | 文档操作 | 获取文档   | 根据 ID 获取                   |
 | 文档操作 | 更新文档   | 更新指定文档                   |
 | 文档操作 | 删除文档   | 删除指定文档                   |
+| 乐观并发 | 读取凭据   | 获取文档及 _seq_no/_primary_term |
+| 乐观并发 | 条件更新   | 凭据匹配才写入；409 带回当前快照 |
+| 乐观并发 | 条件删除   | 凭据匹配才删除；状态语义同上   |
 | 全文检索 | Match 查询 | 分词匹配查询                   |
 | 全文检索 | Term 查询  | 精确匹配查询                   |
 | 全文检索 | Bool 查询  | 组合条件查询                   |
@@ -90,7 +96,17 @@ classDiagram
 - `DELETE /{index}/_doc/{id}` - 删除文档
 - `POST /{index}/_bulk` - 批量操作
 
-### 4.3 搜索接口
+### 4.3 乐观并发控制（条件读写）
+
+- `GET /{index}/_doc/{id}` - 读取文档并获取编辑凭据（`_seq_no` + `_primary_term`）
+- `POST /{index}/_update/{id}?if_seq_no={n}&if_primary_term={t}` - 条件更新
+- `DELETE /{index}/_doc/{id}?if_seq_no={n}&if_primary_term={t}` - 条件删除
+
+凭据匹配时写入成功并返回新的版本信息；凭据过期返回 409
+（`version_conflict_engine_exception`），客户端同时 GET 当前快照一并返回给调用方；
+文档不存在返回 404；无效凭据由客户端校验直接拒绝；其余服务端错误抛出异常。
+
+### 4.4 搜索接口
 
 - `POST /{index}/_search` - 搜索文档
 
