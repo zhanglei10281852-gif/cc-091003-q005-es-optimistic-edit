@@ -391,8 +391,163 @@ void demoDocumentCRUD(ESClient& client, const std::string& indexName) {
     }
 }
 
+// 乐观并发控制演示：两个独立客户端交错编辑同一篇文章
+// 返回 true 表示所有检查通过
+bool demoOptimisticConcurrency(ESClient& client,
+                               const std::string& host,
+                               int port,
+                               const std::string& indexName) {
+    printSection(10, "乐观并发控制演示（编辑冲突防护）");
+
+    bool allOk = true;
+    auto check = [&](bool ok, const std::string& message) {
+        if (ok) {
+            printSuccess(message);
+        } else {
+            printError(message);
+            allOk = false;
+        }
+    };
+
+    // 两个相互独立的客户端，模拟两位编辑同时工作
+    ESClient editorA(host, port);
+    ESClient editorB(host, port);
+    const std::string docId = "concurrency-demo-1";
+
+    // 准备：非交互式导入仍使用原有的无条件写入接口
+    printInfo("导入演示文章（无条件写入接口，模拟非交互式导入）...");
+    json article = {
+        {"title", "并发编辑演示"},
+        {"content", "两位编辑同时打开这篇文章，分别修改标题和标签。"},
+        {"author", "编辑部"},
+        {"category", "技术"},
+        {"tags", json::array({"初始标签"})},
+        {"created_at", "2024-07-01"}
+    };
+    client.indexDocument(indexName, article, docId);
+
+    // ==================== 场景一：交错保存 ====================
+    printInfo("场景一：两位编辑同时打开同一篇文章，交错保存");
+
+    // 1. 两位编辑同时读取文章，各自取得编辑凭据
+    auto docA = editorA.getDocumentForEdit(indexName, docId);
+    auto docB = editorB.getDocumentForEdit(indexName, docId);
+    check(docA.has_value() && docB.has_value(), "两位编辑均读取到文章并取得编辑凭据");
+    if (!docA || !docB) return false;
+    std::cout << "  编辑A 凭据: seq_no=" << docA->credential.seqNo
+              << ", primary_term=" << docA->credential.primaryTerm << "\n";
+    std::cout << "  编辑B 凭据: seq_no=" << docB->credential.seqNo
+              << ", primary_term=" << docB->credential.primaryTerm << "\n";
+
+    // 2. 编辑A 先保存：修改标题和标签（首个修改成功）
+    printInfo("编辑A 修改标题并保存...");
+    json saveA = {
+        {"title", "并发编辑演示（编辑A修订）"},
+        {"tags", json::array({"初始标签", "A的批注"})}
+    };
+    auto resA = editorA.updateDocumentIfMatch(indexName, docId, docA->credential, saveA);
+    check(resA.success(), "编辑A 首个保存成功，获得新凭据 seq_no=" +
+                          std::to_string(resA.credential.seqNo));
+
+    // 3. 编辑B 持旧凭据保存：应被拒绝（409 冲突），并带回当前快照
+    printInfo("编辑B 持旧凭据保存自己的修改...");
+    json saveB = {
+        {"title", "并发编辑演示（编辑B起的标题）"},
+        {"tags", json::array({"初始标签", "B的分类"})}
+    };
+    auto resB = editorB.updateDocumentIfMatch(indexName, docId, docB->credential, saveB);
+    check(resB.status == ConditionalWriteStatus::Conflict,
+          "编辑B 的旧凭据被拒绝（409 冲突），未静默覆盖编辑A 的修改");
+    check(resB.currentDoc.has_value(), "冲突结果带回当前文章快照，供上层展示差异");
+
+    if (resB.currentDoc) {
+        // 上层展示差异：编辑B 的本地修改 vs 服务端当前内容
+        std::cout << "  --- 差异展示（编辑B 视角）---\n";
+        std::cout << "  本地标题: " << saveB["title"].get<std::string>() << "\n";
+        std::cout << "  当前标题: " << resB.currentDoc->source["title"].get<std::string>() << "\n";
+        std::cout << "  本地标签: " << saveB["tags"].dump() << "\n";
+        std::cout << "  当前标签: " << resB.currentDoc->source["tags"].dump() << "\n";
+    }
+
+    // 4. 编辑B 重新读取，人工合并后再次保存
+    printInfo("编辑B 重新读取文章，人工合并后再次保存...");
+    auto freshB = editorB.getDocumentForEdit(indexName, docId);
+    check(freshB.has_value(), "编辑B 重新读取成功，取得最新凭据");
+    if (!freshB) return false;
+    json merged = {
+        {"title", freshB->source["title"]},                      // 保留编辑A 的标题
+        {"tags", json::array({"初始标签", "A的批注", "B的分类"})}  // 人工合并双方标签
+    };
+    auto resB2 = editorB.updateDocumentIfMatch(indexName, docId, freshB->credential, merged);
+    check(resB2.success(), "编辑B 人工合并后保存成功");
+
+    // 5. 最终确认：ES 中只保留双方明确确认过的内容
+    auto finalDoc = editorA.getDocumentForEdit(indexName, docId);
+    check(finalDoc.has_value(), "最终读取文章成功");
+    if (finalDoc) {
+        bool contentOk = finalDoc->source["title"] == "并发编辑演示（编辑A修订）" &&
+                         finalDoc->source["tags"] == json::array({"初始标签", "A的批注", "B的分类"});
+        check(contentOk, "最终内容为双方明确确认过的合并结果");
+        std::cout << "  最终标题: " << finalDoc->source["title"].get<std::string>() << "\n";
+        std::cout << "  最终标签: " << finalDoc->source["tags"].dump() << "\n";
+    }
+
+    // ==================== 场景二：保存后再删除 ====================
+    printInfo("场景二：一位编辑保存后，另一位编辑删除文章");
+
+    // 1. 两位编辑分别读取当前文章（凭据一致）
+    auto docA2 = editorA.getDocumentForEdit(indexName, docId);
+    auto docB2 = editorB.getDocumentForEdit(indexName, docId);
+    check(docA2.has_value() && docB2.has_value(), "两位编辑均读取到最新文章");
+    if (!docA2 || !docB2) return false;
+
+    // 2. 编辑A 先保存一处修改（首个修改成功）
+    printInfo("编辑A 再次修改并保存...");
+    json saveA2 = {
+        {"tags", json::array({"初始标签", "A的批注", "B的分类", "A的终稿"})}
+    };
+    auto resA2 = editorA.updateDocumentIfMatch(indexName, docId, docA2->credential, saveA2);
+    check(resA2.success(), "编辑A 保存成功");
+
+    // 3. 编辑B 持旧凭据尝试删除：删除同样需要凭据，应被拒绝（409 冲突）
+    printInfo("编辑B 持旧凭据尝试删除文章...");
+    auto delB = editorB.deleteDocumentIfMatch(indexName, docId, docB2->credential);
+    check(delB.status == ConditionalWriteStatus::Conflict,
+          "编辑B 的旧凭据删除被拒绝（409 冲突）");
+    check(delB.currentDoc.has_value(), "删除冲突同样带回当前快照");
+
+    // 4. 编辑B 重新读取，确认内容后删除
+    printInfo("编辑B 重新读取并确认后删除...");
+    auto freshB2 = editorB.getDocumentForEdit(indexName, docId);
+    check(freshB2.has_value(), "编辑B 重新读取成功");
+    if (!freshB2) return false;
+    auto delB2 = editorB.deleteDocumentIfMatch(indexName, docId, freshB2->credential);
+    check(delB2.success(), "编辑B 凭最新凭据删除成功");
+
+    // 5. 编辑A 持已失效凭据再保存：文档已删除，返回 NotFound（与 409 冲突区分）
+    printInfo("编辑A 持失效凭据再次保存...");
+    auto resA3 = editorA.updateDocumentIfMatch(indexName, docId, resA2.credential,
+                                               json{{"title", "不应出现的标题"}});
+    check(resA3.status == ConditionalWriteStatus::NotFound,
+          "文档已删除，返回 NotFound 而非冲突");
+
+    // 6. 最终确认：文章已在明确确认后删除
+    auto gone = editorA.getDocumentForEdit(indexName, docId);
+    check(!gone.has_value(), "最终确认：文章已删除，ES 中只保留明确确认过的内容");
+
+    // ==================== 场景三：无效凭据识别 ====================
+    printInfo("场景三：无效凭据识别");
+    EditCredential badCredential;  // 默认构造（seq_no=-1, primary_term=0），并非读取获得
+    auto badResult = editorA.updateDocumentIfMatch(indexName, docId, badCredential,
+                                                   json{{"title", "不应出现的标题"}});
+    check(badResult.status == ConditionalWriteStatus::InvalidCredential,
+          "无效凭据被识别为 InvalidCredential，与冲突及服务端失败区分");
+
+    return allOk;
+}
+
 void demoCleanup(ESClient& client, const std::string& indexName) {
-    printSection(10, "清理资源");
+    printSection(11, "清理资源");
     
     try {
         client.deleteIndex(indexName);
@@ -456,8 +611,14 @@ int main() {
         demoBoolSearch(client, indexName);
         demoHighlightSearch(client, indexName);
         demoDocumentCRUD(client, indexName);
+        bool concurrencyOk = demoOptimisticConcurrency(client, host, port, indexName);
         demoCleanup(client, indexName);
-        
+
+        if (!concurrencyOk) {
+            printError("乐观并发控制演示存在未通过的检查");
+            return 1;
+        }
+
         printHeader("演示完成！");
         
     } catch (const std::exception& e) {

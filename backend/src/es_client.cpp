@@ -255,6 +255,121 @@ BulkResult ESClient::bulkIndex(const std::string& indexName,
     return result;
 }
 
+// ==================== 乐观并发控制（交互式编辑） ====================
+
+std::optional<VersionedDocument> ESClient::getDocumentForEdit(const std::string& indexName,
+                                                              const std::string& id) {
+    auto response = httpClient_.get(buildUrl("/" + indexName + "/_doc/" + id));
+
+    if (response.isNotFound()) {
+        return std::nullopt;
+    }
+
+    if (!response.isSuccess()) {
+        throw ESException("Failed to get document for edit: " + response.body);
+    }
+
+    auto respJson = json::parse(response.body);
+    if (!respJson.value("found", false)) {
+        return std::nullopt;
+    }
+
+    VersionedDocument doc;
+    doc.id = respJson.value("_id", "");
+    doc.index = respJson.value("_index", "");
+    doc.version = respJson.value("_version", 0LL);
+    doc.credential.seqNo = respJson.value("_seq_no", -1LL);
+    doc.credential.primaryTerm = respJson.value("_primary_term", 0LL);
+    doc.source = respJson.value("_source", json::object());
+    return doc;
+}
+
+ConditionalWriteResult ESClient::updateDocumentIfMatch(const std::string& indexName,
+                                                       const std::string& id,
+                                                       const EditCredential& credential,
+                                                       const json& doc) {
+    ConditionalWriteResult result;
+    result.id = id;
+    result.index = indexName;
+
+    // 客户端预检：明显无效的凭据直接拒绝，不产生请求
+    if (!credential.isValid()) {
+        result.status = ConditionalWriteStatus::InvalidCredential;
+        log("Conditional update rejected (invalid credential): " + id);
+        return result;
+    }
+
+    std::string url = "/" + indexName + "/_update/" + id +
+                      "?if_seq_no=" + std::to_string(credential.seqNo) +
+                      "&if_primary_term=" + std::to_string(credential.primaryTerm);
+    json body = {{"doc", doc}};
+    auto response = httpClient_.post(buildUrl(url), body.dump());
+
+    return handleConditionalWriteResponse(response, std::move(result));
+}
+
+ConditionalWriteResult ESClient::deleteDocumentIfMatch(const std::string& indexName,
+                                                       const std::string& id,
+                                                       const EditCredential& credential) {
+    ConditionalWriteResult result;
+    result.id = id;
+    result.index = indexName;
+
+    // 客户端预检：明显无效的凭据直接拒绝，不产生请求
+    if (!credential.isValid()) {
+        result.status = ConditionalWriteStatus::InvalidCredential;
+        log("Conditional delete rejected (invalid credential): " + id);
+        return result;
+    }
+
+    std::string url = "/" + indexName + "/_doc/" + id +
+                      "?if_seq_no=" + std::to_string(credential.seqNo) +
+                      "&if_primary_term=" + std::to_string(credential.primaryTerm);
+    auto response = httpClient_.del(buildUrl(url));
+
+    return handleConditionalWriteResponse(response, std::move(result));
+}
+
+ConditionalWriteResult ESClient::handleConditionalWriteResponse(const HttpResponse& response,
+                                                                ConditionalWriteResult result) {
+    if (response.isSuccess()) {
+        auto respJson = json::parse(response.body);
+        result.status = ConditionalWriteStatus::Success;
+        result.id = respJson.value("_id", result.id);
+        result.index = respJson.value("_index", result.index);
+        result.result = respJson.value("result", "");
+        result.version = respJson.value("_version", 0LL);
+        result.credential.seqNo = respJson.value("_seq_no", -1LL);
+        result.credential.primaryTerm = respJson.value("_primary_term", 0LL);
+        log("Conditional write succeeded: " + result.id + " (" + result.result + ")");
+        return result;
+    }
+
+    switch (response.statusCode) {
+    case 409:
+        // 凭据已过期：带回当前文档快照供上层展示差异，不自动重试、不覆盖
+        result.status = ConditionalWriteStatus::Conflict;
+        result.currentDoc = getDocumentForEdit(result.index, result.id);
+        log("Conditional write conflict: " + result.id);
+        break;
+    case 404:
+        // 文档不存在或已被删除
+        result.status = ConditionalWriteStatus::NotFound;
+        log("Conditional write target missing: " + result.id);
+        break;
+    case 400:
+        // 服务端判定凭据参数非法
+        result.status = ConditionalWriteStatus::InvalidCredential;
+        log("Conditional write rejected by server (invalid credential): " + result.id);
+        break;
+    default:
+        // 真正的服务端失败（5xx 等），与 409 冲突明确区分
+        throw ESException("Conditional write failed: " + response.body);
+    }
+
+    return result;
+}
+
 // ==================== 搜索操作 ====================
 
 SearchResult ESClient::parseSearchResponse(const json& response) {

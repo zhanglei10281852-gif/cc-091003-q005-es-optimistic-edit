@@ -57,6 +57,65 @@ struct BulkResult {
 };
 
 /**
+ * 编辑凭据（乐观并发控制令牌）
+ *
+ * 读取文档时由 Elasticsearch 返回的 _seq_no 与 _primary_term 对。
+ * 交互式编辑场景下，更新/删除必须原样带回该凭据：
+ * 仅当服务端文档自读取后未被他人修改，写入才会成功。
+ */
+struct EditCredential {
+    long long seqNo = -1;       ///< 对应 ES 的 _seq_no（>= 0 才有效）
+    long long primaryTerm = 0;  ///< 对应 ES 的 _primary_term（>= 1 才有效）
+
+    /**
+     * 凭据是否形式上有效（可随条件写请求发送）
+     */
+    bool isValid() const {
+        return seqNo >= 0 && primaryTerm >= 1;
+    }
+};
+
+/**
+ * 带编辑凭据的文档快照
+ */
+struct VersionedDocument {
+    std::string id;
+    std::string index;
+    long long version = 0;      ///< 文档版本号（仅用于展示，不用于并发控制）
+    EditCredential credential;  ///< 编辑凭据，条件更新/删除时原样带回
+    json source;                ///< 文档内容
+};
+
+/**
+ * 条件写操作的状态
+ */
+enum class ConditionalWriteStatus {
+    Success,           ///< 凭据匹配，写入成功
+    Conflict,          ///< 409：凭据已过期，文档已被他人修改
+    NotFound,          ///< 404：文档不存在或已被删除
+    InvalidCredential  ///< 凭据本身无效（并非读取时获得的合法凭据）
+};
+
+/**
+ * 条件写操作的结果
+ */
+struct ConditionalWriteResult {
+    ConditionalWriteStatus status = ConditionalWriteStatus::Success;
+    std::string id;
+    std::string index;
+    std::string result;             ///< 成功时为 updated / deleted
+    long long version = 0;          ///< 成功时的新版本号
+    EditCredential credential;      ///< 成功时的新凭据（可凭此继续编辑）
+    /// 冲突时带回的当前文档快照，供上层展示差异；
+    /// 文档恰好在冲突之后被删除时为空
+    std::optional<VersionedDocument> currentDoc;
+
+    bool success() const {
+        return status == ConditionalWriteStatus::Success;
+    }
+};
+
+/**
  * Elasticsearch 客户端异常
  */
 class ESException : public std::runtime_error {
@@ -164,7 +223,48 @@ public:
     BulkResult bulkIndex(const std::string& indexName,
                          const std::vector<json>& docs,
                          const std::vector<std::string>& ids = {});
-    
+
+    // ==================== 乐观并发控制（交互式编辑） ====================
+
+    /**
+     * 读取文档并获取编辑凭据（_seq_no / _primary_term）
+     *
+     * 交互式编辑的第一步：取得文档内容与编辑凭据，
+     * 之后通过 updateDocumentIfMatch / deleteDocumentIfMatch 凭凭据写回。
+     *
+     * @return 文档存在时返回带凭据的快照，否则返回 std::nullopt
+     */
+    std::optional<VersionedDocument> getDocumentForEdit(const std::string& indexName,
+                                                        const std::string& id);
+
+    /**
+     * 条件更新文档（乐观并发控制）
+     *
+     * 仅当 credential 与服务端当前 _seq_no/_primary_term 匹配时才写入；
+     * 不匹配时返回 Conflict 并带回当前文档快照供上层展示差异，
+     * 不会自动重试，也不会覆盖他人修改。
+     *
+     * 状态语义：
+     * - Success：写入成功，结果携带新的版本信息与凭据
+     * - Conflict：凭据已过期（409），currentDoc 为当前文档快照
+     * - NotFound：文档不存在或已被删除（404）
+     * - InvalidCredential：凭据本身无效（未携带读取时获得的合法凭据）
+     * - 其他服务端失败（5xx 等）：抛出 ESException，与冲突明确区分
+     */
+    ConditionalWriteResult updateDocumentIfMatch(const std::string& indexName,
+                                                 const std::string& id,
+                                                 const EditCredential& credential,
+                                                 const json& doc);
+
+    /**
+     * 条件删除文档（乐观并发控制）
+     *
+     * 状态语义与 updateDocumentIfMatch 相同。
+     */
+    ConditionalWriteResult deleteDocumentIfMatch(const std::string& indexName,
+                                                 const std::string& id,
+                                                 const EditCredential& credential);
+
     // ==================== 搜索操作 ====================
     
     /**
@@ -237,6 +337,8 @@ private:
     void log(const std::string& message);
     std::string buildUrl(const std::string& path);
     SearchResult parseSearchResponse(const json& response);
+    ConditionalWriteResult handleConditionalWriteResponse(const HttpResponse& response,
+                                                          ConditionalWriteResult result);
 };
 
 } // namespace es

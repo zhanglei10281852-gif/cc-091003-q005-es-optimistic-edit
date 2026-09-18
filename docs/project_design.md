@@ -37,6 +37,9 @@ classDiagram
         +deleteDocument(index, id)
         +search(index, query)
         +bulkIndex(index, docs)
+        +getDocumentForEdit(index, id)
+        +updateDocumentIfMatch(index, id, credential, doc)
+        +deleteDocumentIfMatch(index, id, credential)
     }
 
     class HttpClient {
@@ -69,6 +72,9 @@ classDiagram
 | 文档操作 | 获取文档   | 根据 ID 获取                   |
 | 文档操作 | 更新文档   | 更新指定文档                   |
 | 文档操作 | 删除文档   | 删除指定文档                   |
+| 乐观并发 | 读取凭据   | 读取时返回 _seq_no/_primary_term 编辑凭据 |
+| 乐观并发 | 条件更新   | 凭据匹配才写入，冲突返回当前快照 |
+| 乐观并发 | 条件删除   | 凭据匹配才删除，冲突返回当前快照 |
 | 全文检索 | Match 查询 | 分词匹配查询                   |
 | 全文检索 | Term 查询  | 精确匹配查询                   |
 | 全文检索 | Bool 查询  | 组合条件查询                   |
@@ -90,7 +96,18 @@ classDiagram
 - `DELETE /{index}/_doc/{id}` - 删除文档
 - `POST /{index}/_bulk` - 批量操作
 
-### 4.3 搜索接口
+### 4.3 乐观并发控制
+
+- `GET /{index}/_doc/{id}` - 读取文档并返回 `_seq_no` / `_primary_term` 编辑凭据
+- `POST /{index}/_update/{id}?if_seq_no={s}&if_primary_term={t}` - 条件更新
+- `DELETE /{index}/_doc/{id}?if_seq_no={s}&if_primary_term={t}` - 条件删除
+
+凭据匹配时正常写入并返回新的版本信息；不匹配时 Elasticsearch 返回
+409（version_conflict_engine_exception），客户端带回当前文档快照供上层展示差异；
+文档不存在/已删除返回 404，凭据非法返回 400，其余服务端失败抛出异常，
+四者与 409 冲突明确区分。
+
+### 4.4 搜索接口
 
 - `POST /{index}/_search` - 搜索文档
 

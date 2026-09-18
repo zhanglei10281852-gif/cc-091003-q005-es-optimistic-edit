@@ -79,6 +79,14 @@ make
 - ✅ 更新文档
 - ✅ 删除文档
 
+### 乐观并发控制（编辑冲突防护）
+
+- ✅ 读取文档时一并取得 `_seq_no` / `_primary_term` 编辑凭据
+- ✅ 条件更新 / 条件删除必须携带凭据，匹配才写入
+- ✅ 凭据过期返回 409 冲突并带回当前文档快照，供上层展示差异（不自动重试、不覆盖）
+- ✅ 区分冲突 / 文档不存在或已删除 / 无效凭据 / 服务端失败
+- ✅ 无条件写入接口保留，供非交互式导入使用
+
 ### 全文检索
 
 - ✅ Match 查询（分词匹配）
@@ -140,7 +148,9 @@ make
 2. **批量导入** - 导入示例文章数据
 3. **全文检索** - 演示各种搜索方式
 4. **高亮显示** - 展示搜索结果高亮
-5. **清理资源** - 删除测试索引
+5. **文档 CRUD** - 演示单文档的增删改查（无条件写入接口）
+6. **乐观并发控制** - 两个独立客户端交错保存、保存后再删除的编辑冲突防护
+7. **清理资源** - 删除测试索引
 
 ### 输出示例
 
@@ -173,6 +183,44 @@ make
   演示完成！
 ========================================
 ```
+
+### 乐观并发控制 API 示例
+
+交互式编辑场景（如两位编辑同时修改同一篇文章）使用带凭据的条件写接口，
+避免较晚保存者在不知情的情况下覆盖他人的修改：
+
+```cpp
+// 1. 读取文章，同时取得编辑凭据（_seq_no / _primary_term）
+auto doc = client.getDocumentForEdit("articles", "42");
+if (!doc) { /* 文章不存在或已删除 */ }
+
+// 2. 凭凭据条件保存：仅当服务端文章未被他人修改时才写入
+auto result = client.updateDocumentIfMatch("articles", "42",
+                                           doc->credential,
+                                           {{"title", "新标题"}});
+switch (result.status) {
+case es::ConditionalWriteStatus::Success:
+    // 写入成功，result.credential 为新的编辑凭据，可继续编辑
+    break;
+case es::ConditionalWriteStatus::Conflict:
+    // 409：凭据已过期。result.currentDoc 为当前文章快照，
+    // 可向编辑展示差异，由人工合并后重新读取、重新保存
+    break;
+case es::ConditionalWriteStatus::NotFound:
+    // 文章不存在或已被删除
+    break;
+case es::ConditionalWriteStatus::InvalidCredential:
+    // 凭据本身无效（并非读取时获得的合法凭据）
+    break;
+}
+// 真正的服务端失败（5xx 等）抛出 ESException，与 409 冲突明确区分
+
+// 3. 删除同样需要凭据
+auto del = client.deleteDocumentIfMatch("articles", "42", result.credential);
+```
+
+非交互式导入等无需并发保护的场景，仍可使用原有的
+`indexDocument` / `updateDocument` / `deleteDocument` / `bulkIndex` 无条件写入接口。
 
 ## 扩展开发
 
